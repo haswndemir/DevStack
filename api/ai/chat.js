@@ -1,4 +1,3 @@
-// api/ai/chat.js - Production-Hardened Serverless AI Endpoint
 import fs from 'fs';
 import path from 'path';
 import { GoogleGenAI } from '@google/genai';
@@ -7,19 +6,16 @@ import { getModelDisplayName } from '../model-utils.js';
 import { verifyFirebaseIdToken } from '../auth-verify.js';
 import { checkDistributedRateLimit } from '../rate-limit.js';
 
-// Payload Limits
 const MAX_MESSAGES_COUNT = 30;
 const MAX_MESSAGE_LENGTH = 8000;
 const MAX_TOTAL_PAYLOAD_LENGTH = 40000;
+const VALID_ROLES = ['user', 'model', 'assistant'];
 
-// Production Allowed Origins
 const ALLOWED_ORIGINS = [
   'https://dev-stack-eight.vercel.app',
   'https://app.hasandemir.dev',
   'http://localhost:5173',
   'http://localhost:4173',
-  'http://127.0.0.1:5173',
-  'http://127.0.0.1:4173',
 ];
 
 function resolveApiKey() {
@@ -44,15 +40,10 @@ function resolveApiKey() {
 }
 
 export default async function handler(req, res) {
-  // 1. Strict CORS handling
   const origin = req.headers['origin'] || req.headers['Origin'] || '';
-  const customAllowed = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : [];
-  const fullAllowed = [...ALLOWED_ORIGINS, ...customAllowed];
 
-  if (origin && fullAllowed.includes(origin)) {
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
-  } else if (!origin && process.env.NODE_ENV !== 'production') {
-    res.setHeader('Access-Control-Allow-Origin', '*');
   }
 
   res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -71,7 +62,6 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
-  // 2. Cryptographic Firebase Auth ID Token Verification
   const authHeader = req.headers['authorization'] || req.headers['Authorization'];
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Unauthorized: Missing or malformed authorization header.' });
@@ -87,8 +77,7 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: 'Unauthorized: Invalid or expired authentication token.' });
   }
 
-  // 3. User-based Distributed Rate Limiting
-  const rateLimitResult = checkDistributedRateLimit(verifiedUser.uid);
+  const rateLimitResult = await checkDistributedRateLimit(verifiedUser.uid);
   if (!rateLimitResult.allowed) {
     const retrySec = Math.ceil(rateLimitResult.resetInMs / 1000);
     res.setHeader('Retry-After', retrySec);
@@ -98,36 +87,40 @@ export default async function handler(req, res) {
     });
   }
 
-  // 4. Strict Payload Validation & Anti-Abuse
   const { messages } = req.body || {};
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: 'Invalid payload: messages array is required.' });
   }
 
   if (messages.length > MAX_MESSAGES_COUNT) {
-    return res.status(400).json({ error: `Payload rejected: conversation exceeds maximum of ${MAX_MESSAGES_COUNT} messages.` });
+    return res.status(400).json({ error: 'Payload rejected: conversation exceeds maximum message count.' });
   }
 
   let totalChars = 0;
   const formattedContents = [];
 
   for (const m of messages) {
-    if (!m || typeof m !== 'object') {
-      return res.status(400).json({ error: 'Invalid payload: malformed message object.' });
+    if (!m || typeof m !== 'object' || Array.isArray(m)) {
+      return res.status(400).json({ error: 'Invalid payload: message must be an object.' });
     }
 
-    const role = (m.role === 'ai' || m.role === 'model') ? 'model' : 'user';
+    if (m.role && (typeof m.role !== 'string' || !VALID_ROLES.includes(m.role))) {
+      return res.status(400).json({ error: 'Invalid payload: invalid message role.' });
+    }
+
+    const role = (m.role === 'model' || m.role === 'assistant') ? 'model' : 'user';
+
     let text = '';
     if (typeof m.text === 'string') {
       text = m.text;
-    } else if (Array.isArray(m.parts) && typeof m.parts[0]?.text === 'string') {
+    } else if (Array.isArray(m.parts) && m.parts.length > 0 && typeof m.parts[0]?.text === 'string') {
       text = m.parts[0].text;
     } else {
-      text = '';
+      return res.status(400).json({ error: 'Invalid payload: message text must be a string.' });
     }
 
     if (text.length > MAX_MESSAGE_LENGTH) {
-      return res.status(400).json({ error: `Payload rejected: individual message exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters.` });
+      return res.status(400).json({ error: 'Payload rejected: message exceeds maximum character limit.' });
     }
 
     totalChars += text.length;
@@ -141,7 +134,6 @@ export default async function handler(req, res) {
     });
   }
 
-  // 5. Gemini API Key Resolution
   const apiKey = resolveApiKey();
   if (!apiKey) {
     console.error('[AI Configuration Error] GEMINI_API_KEY is not defined.');
@@ -150,7 +142,6 @@ export default async function handler(req, res) {
     });
   }
 
-  // 6. Gemini Generative Execution
   try {
     const ai = new GoogleGenAI({ apiKey });
     const candidateModels = [AI_CONFIG.model, ...(AI_CONFIG.fallbackModels || [])];
@@ -189,7 +180,6 @@ export default async function handler(req, res) {
       modelDisplay: getModelDisplayName(modelUsed),
     });
   } catch (error) {
-    // 7. Error Sanitization: Prevent internal stack trace/key leakage
     console.error('[AI Engine Failure]:', error);
     return res.status(500).json({
       error: 'An internal error occurred while generating the AI response. Please try again later.',
